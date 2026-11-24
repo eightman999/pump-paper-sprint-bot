@@ -11,9 +11,11 @@
 // for held mints, else the curve's last trade reserves). Selling t tokens into the constant-
 // product curve returns t*vq/(vt+t) quote before fees; the estimated net proceeds subtract the
 // curve fee share (protocol + creator fallback bps) and one tx fee. A position is sold whole when
-// that estimate reaches +TAKE_PROFIT of cost or drops to -STOP_LOSS of cost. Take-profit sells go
-// out at SELL_TP_SLIPPAGE_BPS; stop-loss sells at full slippage so the exit is never refused while
-// a coin keeps falling. A curve that completes is closed by the harness itself (_complete_ fills);
+// that estimate reaches +TAKE_PROFIT of cost or drops to -STOP_LOSS of cost, or when it has been held
+// more than DEAD_MONEY_BATCHES batches with the estimate still within +/-8% of cost (dead money is
+// recycled into fresher candidates). Take-profit sells go out at SELL_TP_SLIPPAGE_BPS; stop-loss and
+// dead-money sells at full slippage so the exit is never refused while a coin keeps falling. A curve
+// that completes is closed by the harness itself (_complete_ fills);
 // a sell then would only be rejected token_complete.
 //
 // Never orders what the caps refuse: buys are clamped to maxBuyLamports, the reply never exceeds
@@ -32,6 +34,7 @@ const MIN_WINDOW_BUYS = 3; // buys required inside the window
 const BUY_SLIPPAGE_BPS = 10_000; // wide open like the baseline: a refused buy just skips the coin
 const TP_SLIPPAGE_BPS = 5_000; // take-profit sells: fills unless the price halved in latency
 const SL_SLIPPAGE_BPS = 10_000; // stop-loss sells: never refused, the exit matters more than the price
+const DEAD_MONEY_BATCHES = 1200; // held this long while flat => sell whole, recycle the capital
 const BPS = 10_000n;
 
 interface Watched {
@@ -42,6 +45,8 @@ interface Watched {
 const watched = new Map<Pubkey, Watched>();
 /** Mints a buy of ours filled on: one entry per coin ever. */
 const entered = new Set<Pubkey>();
+/** Batches each open position has been held, by mint. */
+const heldBatches = new Map<Pubkey, number>();
 
 const watch = (mint: Pubkey): Watched => {
   let w = watched.get(mint);
@@ -81,6 +86,14 @@ await runBot({
 
     const orders: OrderInput[] = [];
 
+    // Age each open position by this batch; forget positions that are gone.
+    for (const mint of [...heldBatches.keys()]) {
+      if (!state.positions.has(mint)) heldBatches.delete(mint);
+    }
+    for (const mint of state.positions.keys()) {
+      heldBatches.set(mint, (heldBatches.get(mint) ?? 0) + 1);
+    }
+
     // Exits first: they free cash and slots for later batches.
     for (const [mint, pos] of state.positions) {
       if (orders.length >= orderCap) break;
@@ -98,6 +111,11 @@ await runBot({
       let slip = -1;
       if (net * 100n >= cost * 160n) slip = TP_SLIPPAGE_BPS;
       else if (net * 100n <= cost * 75n) slip = SL_SLIPPAGE_BPS;
+      else if (
+        (heldBatches.get(mint) ?? 0) > DEAD_MONEY_BATCHES &&
+        net * 100n >= cost * 92n &&
+        net * 100n <= cost * 108n
+      ) slip = SL_SLIPPAGE_BPS;
       if (slip < 0) continue;
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: slip });
       busy.add(mint);
